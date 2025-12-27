@@ -2,9 +2,10 @@
 Core agent logic: signal filtering, policy decisions, action planning, outreach generation.
 """
 
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 from datetime import datetime, timedelta
 from dataclasses import asdict
+from functools import lru_cache
 
 from sago.models import (
     Signal,
@@ -40,14 +41,20 @@ class SignalFilter:
 
     def prioritize(self, signals: List[Signal]) -> List[Signal]:
         """Rank signals by type priority and confidence."""
-
-        def score(s: Signal) -> float:
-            type_weight = self.TYPE_PRIORITY.get(s.signal_type, 0.5)
-            days_old = (datetime.utcnow() - s.detected_at).days
-            recency = max(0, 1 - days_old / 30)
-            return s.confidence * type_weight * 0.7 + recency * 0.3
-
-        return sorted(signals, key=score, reverse=True)
+        now = datetime.utcnow()
+        return sorted(
+            signals,
+            key=lambda s: self._score_signal(s, now),
+            reverse=True
+        )
+    
+    @staticmethod
+    def _score_signal(signal: Signal, now: datetime) -> float:
+        """Calculate priority score for a signal."""
+        type_weight = SignalFilter.TYPE_PRIORITY.get(signal.signal_type, 0.5)
+        days_old = (now - signal.detected_at).days
+        recency = max(0, 1 - days_old / 30)
+        return signal.confidence * type_weight * 0.7 + recency * 0.3
 
 
 class Policy:
@@ -89,12 +96,13 @@ class Policy:
 
     def _matches_trigger(self, signals: List[Signal], trigger: str) -> bool:
         """Check if any signal matches the follow-up trigger."""
-        trigger_words = trigger.lower().split()
+        trigger_words = set(trigger.lower().split())
         signal_text = " ".join(
             [f"{s.title} {s.description}".lower() for s in signals]
         )
         matched = sum(1 for w in trigger_words if w in signal_text)
-        return matched >= len(trigger_words) // 2
+        min_required = max(1, len(trigger_words) // 2)
+        return matched >= min_required
 
 
 class ActionPlanner:
@@ -103,6 +111,8 @@ class ActionPlanner:
     def plan(self, signals: List[Signal], company_id: str) -> List[PlannedAction]:
         """Generate action plan from signals."""
         actions = []
+        signal_ids = [s.id for s in signals]
+        signal_by_type = self._group_signals_by_type(signals)
 
         # Primary: outreach email
         actions.append(
@@ -110,43 +120,16 @@ class ActionPlanner:
                 action_type=ActionType.SEND_EMAIL,
                 company_id=company_id,
                 description="Draft personalized re-engagement email",
-                signal_ids=[s.id for s in signals],
+                signal_ids=signal_ids,
                 requires_approval=True,
             )
         )
 
         # Secondary actions based on signal type
-        for signal in signals:
-            if signal.signal_type == SignalType.NEED:
-                actions.append(
-                    PlannedAction(
-                        action_type=ActionType.SHARE_RESOURCE,
-                        company_id=company_id,
-                        description=f"Share resource (triggered by: {signal.title})",
-                        signal_ids=[signal.id],
-                        requires_approval=False,
-                    )
-                )
-            elif signal.signal_type == SignalType.HIRING:
-                actions.append(
-                    PlannedAction(
-                        action_type=ActionType.REQUEST_INTRO,
-                        company_id=company_id,
-                        description=f"Offer candidate intros (triggered by: {signal.title})",
-                        signal_ids=[signal.id],
-                        requires_approval=True,
-                    )
-                )
-            elif signal.signal_type == SignalType.RISK:
-                actions.append(
-                    PlannedAction(
-                        action_type=ActionType.FLAG_FOR_REVIEW,
-                        company_id=company_id,
-                        description=f"Flag for review (triggered by: {signal.title})",
-                        signal_ids=[signal.id],
-                        requires_approval=False,
-                    )
-                )
+        for signal_type, type_signals in signal_by_type.items():
+            action = self._create_action_for_type(signal_type, company_id, type_signals)
+            if action:
+                actions.append(action)
 
         # Always log to CRM
         actions.append(
@@ -154,12 +137,54 @@ class ActionPlanner:
                 action_type=ActionType.LOG_TO_CRM,
                 company_id=company_id,
                 description="Record signals and outreach in CRM",
-                signal_ids=[s.id for s in signals],
+                signal_ids=signal_ids,
                 requires_approval=False,
             )
         )
 
         return actions
+    
+    @staticmethod
+    def _group_signals_by_type(signals: List[Signal]) -> Dict[SignalType, List[Signal]]:
+        """Group signals by type."""
+        grouped: Dict[SignalType, List[Signal]] = {}
+        for signal in signals:
+            if signal.signal_type not in grouped:
+                grouped[signal.signal_type] = []
+            grouped[signal.signal_type].append(signal)
+        return grouped
+    
+    @staticmethod
+    def _create_action_for_type(signal_type: SignalType, company_id: str, signals: List[Signal]) -> Optional[PlannedAction]:
+        """Create an action based on signal type."""
+        signal_ids = [s.id for s in signals]
+        titles = ", ".join(s.title for s in signals[:2])
+        
+        if signal_type == SignalType.NEED:
+            return PlannedAction(
+                action_type=ActionType.SHARE_RESOURCE,
+                company_id=company_id,
+                description=f"Share resource (triggered by: {titles})",
+                signal_ids=signal_ids,
+                requires_approval=False,
+            )
+        elif signal_type == SignalType.HIRING:
+            return PlannedAction(
+                action_type=ActionType.REQUEST_INTRO,
+                company_id=company_id,
+                description=f"Offer candidate intros (triggered by: {titles})",
+                signal_ids=signal_ids,
+                requires_approval=True,
+            )
+        elif signal_type == SignalType.RISK:
+            return PlannedAction(
+                action_type=ActionType.FLAG_FOR_REVIEW,
+                company_id=company_id,
+                description=f"Flag for review (triggered by: {titles})",
+                signal_ids=signal_ids,
+                requires_approval=False,
+            )
+        return None
 
 
 class OutreachGenerator:
@@ -173,19 +198,9 @@ class OutreachGenerator:
         last_interaction: Optional[Interaction],
     ) -> str:
         """Generate personalized re-engagement message."""
-
-        # Build signal summary
-        signal_lines = [f"  - {s.title}" for s in signals[:3]]
-        signals_text = "\n".join(signal_lines)
-
-        # Extract context
-        thesis = ", ".join(user.thesis_keywords[:3])
-        availability = " or ".join(user.availability_slots[:2]) if user.availability_slots else "this week"
-
-        # Reference past interaction
-        past_context = ""
-        if last_interaction and last_interaction.notes:
-            past_context = last_interaction.notes.split(".")[0]
+        signals_text = self._format_signals(signals)
+        thesis = self._format_thesis(user)
+        availability = self._format_availability(user)
 
         message = f"""Hi {company.name} team,
 
@@ -204,6 +219,21 @@ Best,
 {user.name}"""
 
         return message
+    
+    @staticmethod
+    def _format_signals(signals: List[Signal]) -> str:
+        """Format signals into readable list."""
+        return "\n".join(f"  - {s.title}" for s in signals[:3])
+    
+    @staticmethod
+    def _format_thesis(user: UserProfile) -> str:
+        """Format investor thesis keywords."""
+        return ", ".join(user.thesis_keywords[:3]) if user.thesis_keywords else "our focus areas"
+    
+    @staticmethod
+    def _format_availability(user: UserProfile) -> str:
+        """Format availability slots."""
+        return " or ".join(user.availability_slots[:2]) if user.availability_slots else "this week"
 
 
 class ReengagementAgent:

@@ -4,9 +4,10 @@ Domain models for the Sago Re-Engagement Agent.
 
 from enum import Enum
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Set
 from dataclasses import dataclass, field
 import uuid
+from functools import lru_cache
 
 
 class SignalType(str, Enum):
@@ -74,7 +75,21 @@ class Signal:
     embedding: Optional[List[float]] = None
 
     def is_actionable(self, threshold: float = 0.6) -> bool:
+        """Check if signal meets confidence threshold and is not a risk."""
         return self.confidence >= threshold and self.signal_type != SignalType.RISK
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert signal to dictionary."""
+        return {
+            'id': self.id,
+            'company_id': self.company_id,
+            'signal_type': self.signal_type.value,
+            'source': self.source.value,
+            'title': self.title,
+            'description': self.description,
+            'confidence': self.confidence,
+            'detected_at': self.detected_at.isoformat(),
+        }
 
 
 @dataclass

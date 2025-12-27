@@ -6,6 +6,8 @@ from abc import ABC, abstractmethod
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from dataclasses import dataclass
+import asyncio
+import json
 
 from sago.models import Signal, SignalType, SignalSource
 
@@ -215,7 +217,6 @@ class LLMClient:
     async def detect_signals(self, text: str, company: str) -> List[Signal]:
         """Use LLM to extract signals from text."""
         import openai
-        import json
 
         client = openai.AsyncOpenAI(api_key=self.api_key)
 
@@ -238,27 +239,8 @@ Return [] if no signals found."""
         )
 
         content = response.choices[0].message.content
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0]
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0]
-
-        try:
-            data = json.loads(content.strip())
-            return [
-                Signal(
-                    company_id="",
-                    signal_type=SignalType(s["signal_type"]),
-                    source=SignalSource.MANUAL,
-                    title=s["title"],
-                    description=s["description"],
-                    evidence=s["evidence"],
-                    confidence=float(s["confidence"]),
-                )
-                for s in data
-            ]
-        except (json.JSONDecodeError, KeyError):
-            return []
+        content = self._extract_json_from_response(content)
+        return self._parse_signals_from_json(content, company)
 
     async def generate_outreach(
         self,
@@ -273,11 +255,59 @@ Return [] if no signals found."""
 
         client = openai.AsyncOpenAI(api_key=self.api_key)
 
+        prompt = self._build_outreach_prompt(company, signals, notes, thesis, availability)
+
+        response = await client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+        )
+
+        return response.choices[0].message.content.strip()
+    
+    @staticmethod
+    def _extract_json_from_response(content: str) -> str:
+        """Extract JSON from LLM response."""
+        if "```json" in content:
+            return content.split("```json")[1].split("```")[0]
+        elif "```" in content:
+            return content.split("```")[1].split("```")[0]
+        return content
+    
+    @staticmethod
+    def _parse_signals_from_json(content: str, company: str) -> List[Signal]:
+        """Parse signals from JSON string."""
+        try:
+            data = json.loads(content.strip())
+            return [
+                Signal(
+                    company_id="",
+                    signal_type=SignalType(s["signal_type"]),
+                    source=SignalSource.MANUAL,
+                    title=s["title"],
+                    description=s["description"],
+                    evidence=s["evidence"],
+                    confidence=float(s["confidence"]),
+                )
+                for s in data
+            ]
+        except (json.JSONDecodeError, KeyError, ValueError):
+            return []
+    
+    @staticmethod
+    def _build_outreach_prompt(
+        company: str,
+        signals: List[Signal],
+        notes: str,
+        thesis: List[str],
+        availability: List[str],
+    ) -> str:
+        """Build the outreach generation prompt."""
         signals_text = "\n".join([f"- {s.title}: {s.description}" for s in signals])
-        thesis_text = ", ".join(thesis)
+        thesis_text = ", ".join(thesis) if thesis else "our focus"
         avail_text = ", ".join(availability) if availability else "this week"
 
-        prompt = f"""Write a re-engagement email to {company}.
+        return f"""Write a re-engagement email to {company}.
 
 Previous notes: {notes}
 
@@ -288,11 +318,3 @@ Investor thesis: {thesis_text}
 Availability: {avail_text}
 
 Write concisely (under 150 words), reference past conversation, highlight new signals, offer help."""
-
-        response = await client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-        )
-
-        return response.choices[0].message.content.strip()
